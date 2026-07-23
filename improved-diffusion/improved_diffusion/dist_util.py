@@ -1,82 +1,84 @@
 """
 Helpers for distributed training.
+
+Uses torchrun-style environment variables (``RANK``, ``WORLD_SIZE``,
+``LOCAL_RANK``, ``MASTER_ADDR``, ``MASTER_PORT``) instead of MPI.
+
+* Single-GPU: ``python scripts/train.py ...``
+* Multi-GPU/multi-node: ``torchrun --nproc_per_node=N scripts/train.py ...``
 """
 
 import io
 import os
-import socket
 
-import blobfile as bf
-from mpi4py import MPI
 import torch as th
 import torch.distributed as dist
 
-# Change this to reflect your cluster layout.
-# The GPU for a given rank is (rank % GPUS_PER_NODE).
-GPUS_PER_NODE = 1 #8
 
-SETUP_RETRY_COUNT = 3
+def _world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def _local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
 
 
 def setup_dist():
     """
-    Setup a distributed process group.
+    Initialize ``torch.distributed`` from torchrun env vars. For single-process
+    runs the group is still initialized (``world_size=1``) so that callers can
+    freely use ``dist.get_rank()`` / ``dist.get_world_size()``.
     """
     if dist.is_initialized():
         return
 
-    comm = MPI.COMM_WORLD
-    backend = "gloo" if not th.cuda.is_available() else "nccl"
-
-    if backend == "gloo":
-        hostname = "localhost"
-    else:
-        hostname = socket.gethostbyname(socket.getfqdn())
-    os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
-    os.environ["RANK"] = str(comm.rank)
-    os.environ["WORLD_SIZE"] = str(comm.size)
-
-    port = comm.bcast(_find_free_port(), root=0)
-    os.environ["MASTER_PORT"] = str(port)
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    backend = "nccl" if th.cuda.is_available() else "gloo"
     dist.init_process_group(backend=backend, init_method="env://")
 
 
 def dev():
     """
-    Get the device to use for torch.distributed.
+    Get the device to use for this process.
     """
     if th.cuda.is_available():
-        return th.device(f"cuda:{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}")
+        return th.device(f"cuda:{_local_rank() % max(th.cuda.device_count(), 1)}")
     return th.device("cpu")
 
 
 def load_state_dict(path, **kwargs):
     """
-    Load a PyTorch file without redundant fetches across MPI ranks.
+    Load a PyTorch checkpoint. Rank 0 reads from disk and broadcasts to the
+    other ranks so that shared storage is not hammered by every process.
     """
-    if MPI.COMM_WORLD.Get_rank() == 0:
-        with bf.BlobFile(path, "rb") as f:
+    if _world_size() <= 1 or not dist.is_initialized():
+        return th.load(path, **kwargs)
+
+    if _rank() == 0:
+        with open(path, "rb") as f:
             data = f.read()
+        payload = [data]
     else:
-        data = None
-    data = MPI.COMM_WORLD.bcast(data)
-    return th.load(io.BytesIO(data), **kwargs)
+        payload = [None]
+    dist.broadcast_object_list(payload, src=0)
+    return th.load(io.BytesIO(payload[0]), **kwargs)
 
 
 def sync_params(params):
     """
-    Synchronize a sequence of Tensors across ranks from rank 0.
+    Broadcast a sequence of Tensors from rank 0 to every other rank.
+    No-op in single-process runs.
     """
+    if _world_size() <= 1 or not dist.is_initialized():
+        return
     for p in params:
         with th.no_grad():
             dist.broadcast(p, 0)
-
-
-def _find_free_port():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
-    finally:
-        s.close()
