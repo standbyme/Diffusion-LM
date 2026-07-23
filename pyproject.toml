@@ -10,6 +10,7 @@ dependencies = [
     "spacy>=3.8.13",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
+    "transformers[torch]>=5.14.1",
     "wandb>=0.28.1",
 ]
 
