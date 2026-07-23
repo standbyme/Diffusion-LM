@@ -7,11 +7,7 @@ requires-python = ">=3.14"
 dependencies = [
     "datasets>=5.0.0",
     "huggingface-hub>=1.24.0",
-    "mpi4py>=4.1.2",
     "spacy>=3.8.13",
-    "torch>=2.13.0",
-    "torchvision>=0.28.0",
-    "transformers[torch]>=5.14.1",
     "wandb>=0.28.1",
 ]
 
